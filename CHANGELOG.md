@@ -2,6 +2,15 @@
 
 See [AGENTS.md](AGENTS.md) for the project goal, pipeline, and working conventions.
 
+## Branch organization
+
+- **`main`** contains the acquisition-only file tree. A normal cleanup commit removes the originally committed prototype parser while preserving published history.
+- **`parser-1`** preserves the exact parser implementation and tests from before the parser-2 experiment, including the earlier JPMorgan/Walmart fixes and validation report. The parser source is unchanged by this branch separation.
+- **`parser-2`** builds on parser-1 and contains the section-vocabulary, grouped-heading, and selected-boundary experiment. Parser work is saved as commits so switching to main does not carry it along as uncommitted changes.
+- Raw filings and generated parsing outputs remain local. The repository-local ignore rules keep parsed data out of main's working-tree status without deleting it.
+
+Switch to the desired parser branch before running its pipeline. The parser-1 dataset-assembly proposal and the parser-2 validation work remain separate next steps.
+
 ## 2026-11-08 — Cross-issuer section comparison
 
 ### Current work
