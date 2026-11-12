@@ -103,10 +103,85 @@ created. Validation and ticker-lookup failures happen before a run folder exists
 References: [SEC API documentation](https://www.sec.gov/search-filings/edgar-application-programming-interfaces)
 and [SEC access guidance](https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data).
 
+## Step 2: Extract section narrative and separate tables
+
+Install the parser dependency into your Python environment:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+Pass a completed acquisition manifest to [parse_sections.py](./scripts/parse_sections.py):
+
+```bash
+python3 scripts/parse_sections.py \
+  data/sec/CIK0000320193/20261016T011541950228Z-0d7286e3/manifest.json \
+  --form 10-Q --output data/parsed
+```
+
+Replace the manifest path with the one printed by your acquisition run. Omit
+`--form` to process supported forms in the manifest. To parse one HTML filing,
+pass its path instead and specify `--form 10-Q`, `10-K`, or `8-K`. Amendments
+are also accepted. Plain-text filings are not currently supported.
+
+Each filing produces two UTF-8 CSVs in the output directory:
+
+- `<filing>_filing_sections.csv`: section narrative, with source filename, form,
+  part, item number, heading or descriptive label, count of separated tables,
+  and an `ExtractionNote` when an alternate source layout was used.
+- `<filing>_filing_tables.csv`: the separated table text, associated with its
+  section. Rows are retained as lines and cells are separated with ` | `.
+
+The parser identifies headings by item number and part, allowing title changes
+between years. It retains paragraph boundaries and visible inline XBRL text,
+removes hidden XBRL metadata and linked contents tables, and stops at signatures.
+It preserves prose in layout tables while separating numeric grids and other
+multi-column data tables. Add `--include-tables` to also include table text in
+the section CSV. Original downloaded HTML remains unchanged.
+
+Repeated part labels on page headers do not end a section. For annual filings,
+item numbers determine the part even when page headers combine parts. Where
+MD&A begins with its descriptive introductory paragraph, the parser can recover
+that body up to the financial-report boundary. An annual Item 7 pointer to MD&A
+later in the same HTML is retained alongside the recovered body. Short quarterly
+risk disclosures that refer to an annual report stay as their original text.
+
+Table classification and heading detection are heuristics. Review unfamiliar
+issuers and layouts before using their text in an analysis: unusual prose tables
+can be classified as data, unusual data tables can remain in the narrative, and
+heading-like references can be mistaken for section boundaries. Missing items
+are omitted rather than filled with artificial text. Cover pages and text before
+the first item are excluded. The table CSV preserves removed table text within
+detected sections; it does not preserve original table formatting. An 8-K can
+only include the primary document downloaded by the acquisition script, not
+unacquired exhibits.
+
+### Compare the validation sample with source HTML
+
+[validate_sections.py](./scripts/validate_sections.py) independently compares
+Risk Factors and MD&A with source HTML blocks and verifies the source checksums:
+
+```bash
+python3 scripts/validate_sections.py \
+  --input data/sec/validation \
+  --parsed data/parsed/validation \
+  --output data/parsed/validation/comparison.json \
+  --report docs/sec_section_validation.md
+```
+
+It checks source prose retention, part/item metadata, and whether numeric table
+rows appear in the narrative or companion tables. It returns a failing exit code
+when these checks find discrepancies. The audit targets the sample's layouts;
+its word-count and numeric-row criteria do not certify every short bullet,
+heading, footnote, table format, or other filing section. See the
+[2026-11-08 comparison](./docs/sec_section_validation_2026-11-08.md) for per-accession
+results and the exact audit limits.
+
 ## Verification
 
-The offline test suite checks selection, history pagination, ticker lookup,
-validation, provenance hashes, retry handling, and partial-run failures:
+The offline test suite checks acquisition, section boundaries, title variations,
+table separation, layout-table prose, hidden metadata, CSV output, and optional
+integration checks against locally downloaded filings:
 
 ```bash
 python3 -m unittest discover -s tests -v
