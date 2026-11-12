@@ -2,12 +2,6 @@
 
 Determining financial risk using NLP on EDGAR documents.
 
-The local branches separate the pipeline versions: `main` contains acquisition,
-`parser-1` contains the original improved section parser, and `parser-2` contains
-the boundary-selection experiment. Parser changes are saved as commits; use
-`git switch parser-1` or `git switch parser-2` to select the implementation.
-Downloaded and generated data stays local when switching branches.
-
 ## Step 1: Acquire SEC filings
 
 Requires Python 3.10 or newer. The acquisition command uses only Python's standard
@@ -130,16 +124,30 @@ Replace the manifest path with the one printed by your acquisition run. Omit
 pass its path instead and specify `--form 10-Q`, `10-K`, or `8-K`. Amendments
 are also accepted. Plain-text filings are not currently supported.
 
-Each filing produces two UTF-8 CSVs in the output directory:
+Each filing produces two UTF-8 CSVs and a diagnostic JSON file in the output directory:
 
 - `<filing>_filing_sections.csv`: section narrative, with source filename, form,
   part, item number, heading or descriptive label, count of separated tables,
-  and an `ExtractionNote` when an alternate source layout was used.
+  and an `ExtractionNote` when an alternate source layout was used. `ItemMembers`,
+  `BlockSpans`, and `BoundaryEvidence` are JSON-valued columns for group membership,
+  prepared-text ranges, and the evidence used to select each start.
 - `<filing>_filing_tables.csv`: the separated table text, associated with its
   section. Rows are retained as lines and cells are separated with ` | `.
+- `<filing>_section_index.json`: accepted starts/spans, explicit stopping points,
+  anchor positions, and rejected candidates with their reasons. Positions refer
+  to the prepared text blocks, not raw HTML byte offsets.
 
-The parser identifies headings by item number and part, allowing title changes
-between years. It retains paragraph boundaries and visible inline XBRL text,
+The parser first checks heading candidates against an explicit form/part item
+vocabulary, then selects starts using contents-anchor evidence, intervening body
+text, and heading formatting. It slices between selected starts in document
+order; item numbers do not have to increase. Discarded candidates do not end an
+accepted section. The item vocabularies are based on the SEC's
+[10-K](https://www.sec.gov/files/form10-k.pdf),
+[10-Q](https://www.sec.gov/files/form10-q.pdf), and
+[8-K](https://www.sec.gov/files/form8-k.pdf) definitions and must be reviewed if
+those forms change. Optional items are allowed, not required.
+
+It retains paragraph boundaries and visible inline XBRL text,
 removes hidden XBRL metadata and linked contents tables, and stops at signatures.
 It preserves prose in layout tables while separating numeric grids and other
 multi-column data tables. Add `--include-tables` to also include table text in
@@ -152,6 +160,34 @@ that body up to the financial-report boundary. An annual Item 7 pointer to MD&A
 later in the same HTML is retained alongside the recovered body. Short quarterly
 risk disclosures that refer to an annual report stay as their original text.
 
+Explicit grouped headings such as `Items 1 and 2` produce one physical row with
+`Item` set to `1;2` and `ItemMembers` set to `["1", "2"]`. Keep that shared span as
+one document record when assembling an NLP dataset. Overlapping group/individual
+identities, groups crossing parts, and ambiguous ranged headings such as
+`Items 1–3` raise review errors instead of guessing. Unknown item numbers remain
+in the surrounding text, are logged in the section index, and produce a CLI
+warning. The 8-K vocabulary covers modern decimal-numbered items; old
+integer-numbered 8-K forms require separate support.
+
+### Try the parser-2 experiment
+
+Run from the repository root. Separate output preserves the previous extraction:
+
+```bash
+for manifest in data/sec/validation/CIK*/*/manifest.json; do
+  python3 scripts/parse_sections.py "$manifest" \
+    --output data/parsed/parser-2/validation || break
+done
+
+python3 scripts/validate_sections.py \
+  --parsed data/parsed/parser-2/validation \
+  --output data/parsed/parser-2/validation/comparison.json
+```
+
+The experiment uses an ordered block array and hashmaps for anchor locations and
+competing part/item candidates. It introduces no trained model. See the
+[branch trial report](./docs/parser_2_trial_2026-11-11.md) for results and limits.
+
 Table classification and heading detection are heuristics. Review unfamiliar
 issuers and layouts before using their text in an analysis: unusual prose tables
 can be classified as data, unusual data tables can remain in the narrative, and
@@ -161,6 +197,11 @@ the first item are excluded. The table CSV preserves removed table text within
 detected sections; it does not preserve original table formatting. An 8-K can
 only include the primary document downloaded by the acquisition script, not
 unacquired exhibits.
+
+The section index explains boundary decisions; it is not a lossless inventory
+of every original HTML node. Existing hidden-markup, page-furniture, and table
+cleanup still applies. Candidate selection remains heuristic, and the current
+source comparison does not independently certify grouped disclosures.
 
 ### Compare the validation sample with source HTML
 

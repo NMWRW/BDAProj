@@ -6,14 +6,14 @@ Original downloaded documents are never modified. No network access is used.
 Run from the repository root: python3 scripts/parse_sections.py --help
 
 Processing order:
-1. Read the filing HTML and remove hidden metadata and contents tables.
-2. Replace data tables with markers, keeping their text for a separate CSV.
-3. Find part/item headings and collect the text belonging to each section.
-4. Write one narrative CSV and one companion table CSV for each filing.
+1. Retain heading/anchor evidence while preparing the filing HTML.
+2. Select acceptable part/item starts in source-document order.
+3. Extract between selected starts and separate financial-table text.
+4. Write narrative/table CSVs and a diagnostic section-index JSON file.
 """
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import csv
 from dataclasses import dataclass
 import json
@@ -43,6 +43,93 @@ BLOCKS = {"p", "div", "section", "article", "h1", "h2", "h3", "h4",
 SUPPORTED_FORMS = {"10-Q", "10-Q/A", "10-K", "10-K/A", "8-K", "8-K/A"}
 MDNA_INTRO = re.compile(r"^The following is Management[’']s discussion and analysis\b", re.I)
 PART_LABEL = re.compile(r"^Parts?\s+(?:IV|III|II|I)(?:\s+and\s+(?:IV|III|II|I))?[.]?$", re.I)
+# Vocabulary, not ordering constraints. Items can appear in any document order.
+# Sources: https://www.sec.gov/files/form10-k.pdf, form10-q.pdf, form8-k.pdf
+# The catalogue includes optional/current items; their presence is not required.
+ANNUAL_ITEMS = frozenset([str(n) for n in range(1, 17)] +
+                         ["1A", "1B", "1C", "7A", "9A", "9B", "9C"])
+QUARTERLY_ITEMS = {"I": frozenset({"1", "2", "3", "4"}),
+                   "II": frozenset({"1", "1A", "2", "3", "4", "5", "6"})}
+CURRENT_ITEMS = frozenset(
+    f"{section}.{item:02}" for section, count in
+    ((1, 5), (2, 6), (3, 3), (4, 2), (5, 8), (6, 6), (7, 1), (8, 1), (9, 1))
+    for item in range(1, count + 1))
+# A trailing heading period is allowed; decimal item numbers remain one token.
+ITEM_NUMBER = re.compile(r"\d{1,2}(?:\.\d{2})?(?:\s*[A-C])?(?:\(T\))?(?!\w|\.\d)", re.I)
+REFERENCE = re.compile(r"^(?:of|in|under|above|below|contains|discusses|describes|provides|see|refer)\b", re.I)
+CONTINUED = re.compile(r"\bcontinued\b|\bcont\.(?:\s|\)|$)", re.I)
+
+
+def parse_heading(text):
+    """Read a single item or an explicit grouped list without guessing ranges."""
+    prefix = re.match(r"^Items?\s+", text, re.I)
+    if prefix is None:
+        return None
+    rest = text[prefix.end():]
+    match = ITEM_NUMBER.match(rest)
+    if match is None:
+        return None
+    items = [re.sub(r"\s+|\(T\)", "", match[0], flags=re.I).upper()]
+    rest = rest[match.end():]
+    while True:
+        separator = re.match(r"^(?:\s*,\s*(?:(?:and|&)\s*)?|\s+(?:and|&)\s+)", rest, re.I)
+        match = ITEM_NUMBER.match(rest[separator.end():]) if separator else None
+        if match is None:
+            break
+        items.append(re.sub(r"\s+|\(T\)", "", match[0], flags=re.I).upper())
+        rest = rest[separator.end() + match.end():]
+    range_prefix = re.match(r"^\s*(?:[-–—]|through|to)\s*", rest, re.I)
+    endpoint = ITEM_NUMBER.match(rest[range_prefix.end():]) if range_prefix else None
+    if endpoint:
+        tail = rest[range_prefix.end() + endpoint.end():].lstrip(". :–—-\t")
+        if REFERENCE.match(tail):
+            return None
+        raise ValueError("Ranged item heading needs review; use explicit group membership")
+    return tuple(dict.fromkeys(items)), rest.lstrip(". :–—-\t")
+
+
+@dataclass(frozen=True)
+class TextBlock:
+    """One prepared text block, with heading evidence retained from the DOM."""
+    position: int
+    text: str
+    anchors: tuple = ()
+    links: tuple = ()
+    emphasized: bool = False
+
+
+@dataclass(frozen=True)
+class HeadingCandidate:
+    start: int
+    part: str
+    items: tuple
+    title: str
+    evidence: tuple = ()
+    note: str = ""
+    end_limit: int | None = None
+    heading_end: int = 0
+
+    @property
+    def keys(self):
+        return tuple((self.part, item) for item in self.items)
+
+
+@dataclass
+class SectionIndex:
+    """Selected starts are separate from candidates; only starts bound items."""
+    form: str
+    blocks: list
+    tables: dict
+    anchor_positions: dict
+    starts: list
+    stops: tuple
+    rejected: list
+    pointers: dict
+
+    def end_for(self, heading):
+        next_start = next((c.start for c in self.starts if c.start > heading.start), len(self.blocks))
+        stop = next((p for p in self.stops if p > heading.start), len(self.blocks))
+        return min(next_start, stop, heading.end_limit if heading.end_limit is not None else len(self.blocks))
 
 
 def normalize(value):
@@ -65,6 +152,9 @@ class Section:
     text: str
     tables: list
     note: str = ""
+    items: tuple = ()
+    spans: tuple = ()
+    evidence: tuple = ()
 
 
 def table_rows(table):
@@ -105,8 +195,12 @@ def is_data_table(table):
     return multi_column >= 2
 
 
-def visible_blocks(markup):
-    """Return (text blocks, table-id-to-text mapping) before section slicing."""
+def read_document(markup):
+    """Prepare blocks while retaining anchors/formatting for boundary selection.
+
+    This is not a lossless raw-HTML ledger: hidden markup, contents and page
+    furniture are still cleaned. Block positions refer to this prepared stream.
+    """
     soup = BeautifulSoup(markup, "html.parser")
     # XBRL metadata describes machine-readable facts and can duplicate visible
     # filing content. Remove hidden containers, but keep visible inline facts.
@@ -121,6 +215,20 @@ def visible_blocks(markup):
                 or tag.has_attr("hidden") or tag.get("aria-hidden") == "true"
                 or "display:none" in style or "visibility:hidden" in style):
             tag.decompose()
+
+    # Read contents links BEFORE removing contents tables. A heading's anchor
+    # evidence must not disappear during cleanup. Split-cell rows are combined.
+    contents_links = []
+    for anchor in soup.find_all("a", href=True):
+        if not anchor["href"].startswith("#"):
+            continue
+        label = anchor.find_parent("tr") or anchor
+        try:
+            parsed = parse_heading(normalize(label.get_text(" ", strip=True)))
+        except ValueError:
+            parsed = None
+        if parsed:
+            contents_links.append((anchor["href"][1:], parsed[0]))
 
     # Contents entries repeat real headings. Internal links start with "#"
     # and usually point to body headings outside the contents table itself.
@@ -155,37 +263,78 @@ def visible_blocks(markup):
             marker.string = f"[[SEC_TABLE_{number}]]"
             table.replace_with(marker)
 
-    pieces = []
+    raw_blocks = []
+    pieces, anchors, links = [], set(), set()
+    emphasized = False
 
-    def walk(node):
-        """Walk HTML in document order, preserving paragraph/heading breaks."""
+    def flush():
+        nonlocal emphasized
+        text = normalize("".join(pieces))
+        pieces.clear()
+        if text:
+            raw_blocks.append(TextBlock(len(raw_blocks), text, tuple(sorted(anchors)),
+                                        tuple(sorted(links)), emphasized))
+            anchors.clear()
+            links.clear()
+            emphasized = False
+        # Empty <a id=...> and <div id=...> anchors belong to the next block.
+
+    def walk(node, strong=False, href=None):
+        """Walk HTML once, keeping source order and evidence with each block."""
+        nonlocal emphasized
         if isinstance(node, (Comment, Declaration, Doctype, ProcessingInstruction)):
             return
         if isinstance(node, NavigableString):
-            pieces.append(str(node))
+            for i, fragment in enumerate(str(node).split("\n")):
+                if i:
+                    flush()
+                pieces.append(fragment)
+                if fragment.strip():
+                    emphasized |= strong
+                    if href:
+                        links.add(href)
         elif isinstance(node, Tag):
             block = node.name in BLOCKS
             if block or node.name in {"br", "hr"}:
-                pieces.append("\n")
+                flush()
+            for attr in ("id", "name"):
+                if node.get(attr):
+                    anchors.add(str(node[attr]))
+            style = str(node.get("style", ""))
+            strong = strong or node.name in {"h1", "h2", "h3", "h4", "h5", "h6", "b", "strong"} or bool(
+                re.search(r"font-weight\s*:\s*(?:bold|[6-9]00)", style, re.I))
+            if node.name == "a" and node.get("href"):
+                href = node["href"]
             for child in node.children:
-                walk(child)
+                walk(child, strong, href)
             if block:
-                pieces.append("\n")
+                flush()
             elif node.name in {"td", "th"}:
-                # Layout-table cells still need a space between their text.
                 pieces.append(" ")
 
     walk(soup.body or soup)
-    lines = [normalize(line) for line in "".join(pieces).splitlines()]
-    occurrences = Counter(lines)
-    # Drop standalone page numbers and the footer style seen in Apple filings.
-    # Paragraph boundaries survive because normalization happens line by line.
-    lines = [line for line in lines if line and not re.fullmatch(r"\d+", line)
-             and line.casefold() != "table of contents"
-             and not re.search(r"(?:\||/).*Form\s+10-[KQ](?:\s*\|\s*\d+)?$", line, re.I)
-             and not (occurrences[line] >= 3 and len(line) < 90
-                      and re.fullmatch(r".+(?:Inc\.|Corp\.|& Co\.)", line))]
-    return lines, tables
+    flush()
+    occurrences = Counter(b.text for b in raw_blocks)
+    blocks = []
+    for block in raw_blocks:
+        line = block.text
+        if (re.fullmatch(r"\d+", line) or line.casefold() == "table of contents"
+                or re.search(r"(?:\||/).*Form\s+10-[KQ](?:\s*\|\s*\d+)?$", line, re.I)
+                or (occurrences[line] >= 3 and len(line) < 90
+                    and re.fullmatch(r".+(?:Inc\.|Corp\.|& Co\.)", line))):
+            continue
+        blocks.append(TextBlock(len(blocks), line, block.anchors, block.links, block.emphasized))
+    anchor_positions = defaultdict(list)
+    for block in blocks:
+        for anchor in block.anchors:
+            anchor_positions[anchor].append(block.position)
+    return blocks, tables, {key: tuple(value) for key, value in anchor_positions.items()}, contents_links
+
+
+def visible_blocks(markup):
+    """Compatibility helper returning prepared text and separated tables."""
+    blocks, tables, _, _ = read_document(markup)
+    return [b.text for b in blocks], tables
 
 
 def item_part(form, item, current_part):
@@ -219,98 +368,193 @@ def descriptive_mdna_span(lines, form, covered_ranges=()):
     return start, end
 
 
-def extract_sections(markup, form="10-Q", include_tables=False):
-    """Split cleaned HTML into Section objects, optionally reinserting tables."""
+def _allowed(form, part, item):
+    if form.startswith("10-K"):
+        return item in ANNUAL_ITEMS
+    if form.startswith("10-Q"):
+        return item in QUARTERLY_ITEMS.get(part, ())
+    return item in CURRENT_ITEMS
+
+
+def _title_line(text):
+    return len(text) < 180 and bool(re.match(
+        r"^(?:Business|Financial Statements|Management[’']s Discussion|Risk Factors|"
+        r"Unresolved Staff Comments|Staff Comments|Properties|Legal Proceedings|"
+        r"Other Information|Controls|Exhibits|Quantitative|Mine Safety|Defaults|"
+        r"Unregistered|Reserved|Cybersecurity|Market Risk)\b", text, re.I))
+
+
+def build_section_index(markup, form="10-Q"):
+    """Confirm a section map first; numeric item order is never a constraint.
+
+    Dictionaries retain competing candidates for each part/item. The selected
+    starts, kept in source order, are the only item-to-item stopping points.
+    """
     if form not in SUPPORTED_FORMS:
         raise ValueError(f"Unsupported form: {form}")
-    lines, tables = visible_blocks(markup)
-    # A 10-Q begins with Part I. Other forms use explicit parts where present.
+    blocks, tables, anchor_positions, contents_links = read_document(markup)
+    lines = [block.text for block in blocks]
     part = "I" if form.startswith("10-Q") else ""
-    candidates = []
-    boundaries = []
-    # Record candidate item headings and all places a section must stop.
-    # A signature block ends the last item instead of becoming its narrative.
-    for index, line in enumerate(lines):
+    candidates, rejected, stops = [], [], []
+    for position, block in enumerate(blocks):
+        line = block.text
         match = PART.match(line)
-        if match and len(line) < 160:
+        part_heading = PART_LABEL.fullmatch(line) or re.fullmatch(
+            r"PART\s+(?:IV|III|II|I)[.\s:–—-]*(?:FINANCIAL INFORMATION|OTHER INFORMATION)", line, re.I)
+        if match and part_heading:
             next_part = match[1].upper()
-            # Running page headers repeat the current part, including in the
-            # middle of a sentence. Only a change of part ends a section.
             if next_part != part:
-                boundaries.append(index)
+                stops.append(position)
             part = next_part
             continue
-        match = ITEM.match(line)
-        if match and len(line) <= 240:
-            # The length limit helps reject prose that merely mentions an item.
-            item = match[1].upper()
-            part = item_part(form, item, part)
-            candidates.append((index, part, item, line, ""))
-            boundaries.append(index)
-        elif re.fullmatch(r"SIGNATURES?", line, re.I):
-            boundaries.append(index)
-    if not candidates:
-        raise ValueError("No item headings found; inspect the document layout/form")
+        if re.fullmatch(r"SIGNATURES?", line, re.I):
+            stops.append(position)
+            continue
+        parsed = parse_heading(line)
+        if parsed is None:
+            continue
+        items, title = parsed
+        if len(line) > 240 or REFERENCE.match(title):
+            rejected.append({"position": position, "reason": "reference_or_long_prose", "text": line})
+            continue
+        item_parts = {item_part(form, item, part) for item in items}
+        if not all(_allowed(form, item_part(form, item, part), item) for item in items):
+            rejected.append({"position": position, "reason": "not_in_form_vocabulary", "text": line})
+            continue
+        if len(item_parts) != 1:
+            raise ValueError(f"Grouped heading crosses parts and needs review: {line}")
+        candidate_part = next(iter(item_parts))
+        part = candidate_part
+        evidence = ["form_vocabulary", "block_start"]
+        if block.emphasized:
+            evidence.append("styled_heading")
+        if CONTINUED.search(title):
+            evidence.append("continued_header")
+        heading_end = position + 1
+        full_title = line
+        if not title and heading_end < len(lines) and _title_line(lines[heading_end]):
+            full_title += " " + lines[heading_end]
+            heading_end += 1
+            evidence.append("split_heading")
+        candidates.append(HeadingCandidate(position, part, items, full_title,
+                                           tuple(evidence), heading_end=heading_end))
 
+    # Resolve link targets by their actual document positions. Empty anchors,
+    # nested wrappers and PART labels may precede the heading by a few blocks.
+    anchored = set()
+    by_position = {c.start: c for c in candidates}
+    for anchor, members in contents_links:
+        for position in anchor_positions.get(anchor, ()):
+            for probe in range(position, min(position + 4, len(blocks))):
+                candidate = by_position.get(probe)
+                if candidate:
+                    if set(members).issubset(candidate.items):
+                        anchored.add(probe)
+                    break
+                if probe > position and not PART.match(lines[probe - 1]):
+                    break
+    candidates = [HeadingCandidate(c.start, c.part, c.items, c.title,
+                                   c.evidence + (("contents_anchor",) if c.start in anchored else ()),
+                                   c.note, c.end_limit, c.heading_end) for c in candidates]
+
+    # Provisional spans are only evidence for selecting duplicates. They NEVER
+    # become final section endings. Prefer linked starts, starts with body text,
+    # then heading formatting; otherwise keep the first substantive occurrence
+    # so repeated page headings cannot discard the opening pages.
+    provisional = sorted(set([c.start for c in candidates] + stops + [len(blocks)]))
+
+    def priority(candidate):
+        end = next(p for p in provisional if p > candidate.start)
+        has_body = any(not PART_LABEL.fullmatch(line) and not re.fullmatch(r"\d+(?:\s*[-–—]\s*\d+)?", line)
+                       for line in lines[candidate.heading_end:end])
+        return ("contents_anchor" in candidate.evidence, has_body,
+                "styled_heading" in candidate.evidence, -candidate.start)
+
+    alternatives = defaultdict(list)
+    for candidate in candidates:
+        alternatives[candidate.keys].append(candidate)
+    starts = []
+    for choices in alternatives.values():
+        regular = [c for c in choices if "continued_header" not in c.evidence]
+        chosen = max(regular or choices, key=priority)
+        starts.append(chosen)
+        for candidate in choices:
+            if candidate is not chosen:
+                rejected.append({"position": candidate.start, "end": candidate.heading_end,
+                                 "reason": "duplicate_heading", "text": candidate.title})
+    # A combined heading and a separate heading for one of its members must
+    # not silently compete for ownership of the same item identity.
+    owner = {}
+    for candidate in starts:
+        for key in candidate.keys:
+            if key in owner:
+                raise ValueError(f"Overlapping grouped item identities need review: {key}")
+            owner[key] = candidate
+    index = SectionIndex(form, blocks, tables, anchor_positions, sorted(starts, key=lambda c: c.start),
+                         tuple(sorted(set(stops))), rejected, {})
+
+    # Preserve the existing, tested same-document MD&A recovery. Its end is
+    # explicit, and its original pointer remains a separate recorded span.
     mdna_key = ("II", "7") if form.startswith("10-K") else ("I", "2")
-    original = [c for c in candidates if c[1:3] == mdna_key]
-    covered_ranges = [(c[0], next((b for b in boundaries if b > c[0]), len(lines))) for c in original]
-    supplemental = descriptive_mdna_span(lines, form, covered_ranges)
-    pointers = {}
+    original = next((c for c in index.starts if mdna_key in c.keys), None)
+    covered = [(original.start, index.end_for(original))] if original else []
+    supplemental = descriptive_mdna_span(lines, form, covered)
     if supplemental:
         start, end = supplemental
-        # Ordinary item headings already cover their own introductory prose.
-        contained = any(c[0] <= start < next((b for b in boundaries if b > c[0]), len(lines))
-                        for c in original)
-        if not contained:
-            title = original[0][3] if original else "Management’s Discussion and Analysis"
-            if original:
-                old_start = original[0][0]
-                old_end = next((b for b in boundaries if b > old_start), len(lines))
-                pointers[mdna_key] = lines[old_start:old_end]
-            candidates.append((start, *mdna_key, title,
-                               "MD&A located by its introductory paragraph and financial-report boundary; "
-                               "original item pointer retained when present."))
-            boundaries.extend([start, end])
-            # In these quarterlies the financial statements also have a
-            # descriptive heading. Assign them to Part I Item 1 separately.
-            if form.startswith("10-Q") and not any(c[1:3] == ("I", "1") for c in candidates):
-                candidates.append((end, "I", "1", "Financial Statements",
-                                   "Financial statements identified by their descriptive heading."))
-    boundaries = sorted(set(boundaries))
+        if original and len(original.items) != 1:
+            raise ValueError("Referenced MD&A in a grouped item needs review")
+        if original:
+            index.pointers[mdna_key] = (original.start, index.end_for(original))
+            # The confirmed physical pointer still ends the preceding item;
+            # moving its substantive body must not duplicate it into that item.
+            index.stops = tuple(sorted(set(index.stops + (original.start,))))
+            index.starts.remove(original)
+        index.starts.append(HeadingCandidate(start, mdna_key[0], (mdna_key[1],),
+                            original.title if original else "Management’s Discussion and Analysis",
+                            ("descriptive_mdna",),
+                            "MD&A recovered from its introduction to a financial-report boundary; "
+                            "original item pointer retained when present.", end, start))
+        index.stops = tuple(sorted(set(index.stops + (end,))))
+        if form.startswith("10-Q") and not any(("I", "1") in c.keys for c in index.starts):
+            index.starts.append(HeadingCandidate(end, "I", ("1",), "Financial Statements",
+                                ("descriptive_financial_statements",),
+                                "Financial statements identified by their descriptive heading.", heading_end=end + 1))
+        index.starts.sort(key=lambda c: c.start)
+    if not index.starts:
+        raise ValueError("No item headings found; inspect the document layout/form")
+    return index
 
-    # Contents entries have short spans. Prefer the occurrence with the most
-    # body text before the next item, part or signature boundary.
-    best = {}
-    for start, part, item, title, note in candidates:
-        end = next((b for b in boundaries if b > start), len(lines))
-        key = (part, item)
-        # Count characters between headings as an estimate of body content.
-        score = sum(len(line) for line in lines[start + 1:end])
-        # An explicitly bounded descriptive body takes priority over its short
-        # item pointer, even when a synthetic test uses only a tiny body.
-        if key not in best or (bool(note), score) > (bool(best[key][4]), best[key][0]):
-            best[key] = (score, start, end, title, note)
 
+def extract_sections(markup, form="10-Q", include_tables=False, *, section_index=None):
+    """Slice between accepted starts, preserving document order and group spans."""
+    index = section_index or build_section_index(markup, form)
+    if index.form != form:
+        raise ValueError("Section index form does not match requested form")
+    suppressed = {p for r in index.rejected if r["reason"] == "duplicate_heading"
+                  for p in range(r["position"], r["end"])}
     sections = []
-    # Restore document order after choosing one occurrence of each part/item.
-    for (part, item), (_, start, end, title, note) in sorted(best.items(), key=lambda x: x[1][1]):
-        content = lines[start:end]
-        if note and (part, item) in pointers:
-            content = pointers[(part, item)] + content
-        body = "\n".join(line for line in content if not PART_LABEL.fullmatch(line))
+    for heading in index.starts:
+        end = index.end_for(heading)
+        spans = ((heading.start, end),)
+        pointer = index.pointers.get((heading.part, heading.items[0]))
+        if pointer:
+            spans = (pointer,) + spans
+        content = [block.text for start, stop in spans for block in index.blocks[start:stop]
+                   if block.position not in suppressed and not PART_LABEL.fullmatch(block.text)]
+        body = "\n".join(content)
         section_tables = []
 
         def replace_table(match):
             # Attach each table to this section even when its marker disappears
             # from narrative text. --include-tables restores its text in place.
-            value = tables[int(match[1])]
+            value = index.tables[int(match[1])]
             section_tables.append(value)
             return value if include_tables else ""
 
         body = TABLE_MARKER.sub(replace_table, body)
         body = re.sub(r"\n{3,}", "\n\n", body).strip()
-        sections.append(Section(part, item, title, body, section_tables, note))
+        sections.append(Section(heading.part, ";".join(heading.items), heading.title, body,
+                                section_tables, heading.note, heading.items, spans, heading.evidence))
     return sections
 
 
@@ -339,7 +583,7 @@ def filing_inputs(path, form=None):
         raise ValueError("Input must be a primary HTML/XML filing or manifest.json")
 
 
-def write_sections(path, form, sections, output):
+def write_sections(path, form, sections, output, *, section_index=None):
     """Write narrative and table CSVs with matching source/part/item fields."""
     output.mkdir(parents=True, exist_ok=True)
     section_path = output / f"{path.name}_filing_sections.csv"
@@ -348,18 +592,34 @@ def write_sections(path, form, sections, output):
     # extra blank rows on Windows, and UTF-8 preserves punctuation.
     with section_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["Source", "Form", "Part", "Item", "Section", "Text", "TableCount", "ExtractionNote"])
+        writer.writerow(["Source", "Form", "Part", "Item", "Section", "Text", "TableCount", "ExtractionNote",
+                         "ItemMembers", "BlockSpans", "BoundaryEvidence"])
         for section in sections:
             writer.writerow([path.name, form, section.part, section.item,
-                             section.title, section.text, len(section.tables), section.note])
+                             section.title, section.text, len(section.tables), section.note,
+                             json.dumps(section.items or (section.item,)), json.dumps(section.spans),
+                             json.dumps(section.evidence)])
     with table_path.open("w", encoding="utf-8", newline="") as handle:
         # Keep removed table text available for auditing the narrative output.
         writer = csv.writer(handle)
-        writer.writerow(["Source", "Form", "Part", "Item", "Section", "TableNumber", "Text"])
+        writer.writerow(["Source", "Form", "Part", "Item", "Section", "TableNumber", "Text", "ItemMembers"])
         for section in sections:
             for number, table in enumerate(section.tables, 1):
                 writer.writerow([path.name, form, section.part, section.item,
-                                 section.title, number, table])
+                                 section.title, number, table, json.dumps(section.items or (section.item,))])
+    if section_index is not None:
+        # This diagnostic describes decisions in the prepared text stream; it
+        # does not claim every raw HTML node has been inventoried or validated.
+        evidence = {"source": path.name, "form": form, "parser_version": 2,
+                    "position_basis": "prepared_text_blocks", "block_count": len(section_index.blocks),
+                    "anchor_positions": section_index.anchor_positions,
+                    "explicit_stops": [{"position": p, "text": section_index.blocks[p].text}
+                                       for p in section_index.stops],
+                    "sections": [{"part": s.part, "items": s.items, "title": s.title,
+                                  "spans": s.spans, "evidence": s.evidence, "note": s.note}
+                                 for s in sections], "rejected_candidates": section_index.rejected}
+        (output / f"{path.name}_section_index.json").write_text(
+            json.dumps(evidence, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return section_path, table_path
 
 
@@ -378,11 +638,17 @@ def main(argv=None):
     try:
         for path, form in filing_inputs(args.input, args.form):
             try:
-                sections = extract_sections(path.read_bytes(), form, args.include_tables)
-                paths = write_sections(path, form, sections, args.output)
+                markup = path.read_bytes()
+                index = build_section_index(markup, form)
+                sections = extract_sections(markup, form, args.include_tables, section_index=index)
+                paths = write_sections(path, form, sections, args.output, section_index=index)
                 print(f"{path.name}: {len(sections)} sections, "
                       f"{sum(len(s.tables) for s in sections)} tables; {paths[0]}")
                 count += 1
+                unknown = sum(r["reason"] == "not_in_form_vocabulary" for r in index.rejected)
+                if unknown:
+                    print(f"Review {path.name}: {unknown} heading-like blocks outside the form vocabulary; "
+                          "see its section_index.json", file=sys.stderr)
             except (OSError, ValueError) as error:
                 # Continue with other filings, but report a failing exit code
                 # so a partially parsed batch is not mistaken for full success.

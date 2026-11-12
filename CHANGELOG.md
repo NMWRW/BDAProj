@@ -2,18 +2,23 @@
 
 See [AGENTS.md](AGENTS.md) for the project goal, pipeline, and working conventions.
 
-## Branch organization
+## 2026-11-11 — parser-2 boundary experiment
 
-- **`main`** contains the acquisition-only file tree. A normal cleanup commit removes the originally committed prototype parser while preserving published history.
-- **`parser-1`** preserves the exact parser implementation and tests from before the parser-2 experiment, including the earlier JPMorgan/Walmart fixes and validation report. The parser source is unchanged by this branch separation.
-- **`parser-2`** builds on parser-1 and contains the section-vocabulary, grouped-heading, and selected-boundary experiment. Parser work is saved as commits so switching to main does not carry it along as uncommitted changes.
-- Raw filings and generated parsing outputs remain local. The repository-local ignore rules keep parsed data out of main's working-tree status without deleting it.
+### Current work
 
-Switch to the desired parser branch before running its pipeline. The parser-1 dataset-assembly proposal and the parser-2 validation work remain separate next steps.
+- **Created and checked out `parser-2`.** Existing uncommitted work was retained. The experiment changes the parser in this branch and saves trial output separately under the ignored `data/parsed/parser-2/validation/` directory.
+- **Select starts before slicing.** Form/part item vocabularies constrain candidate identities. Contents links and DOM formatting survive preparation as evidence. Dictionaries retain competing candidates; selected starts are ordered by document position, including out-of-order items. Rejected duplicate candidates no longer truncate preceding sections.
+- **Grouped items share a span.** Explicit lists such as `Items 1 and 2` produce one row with item membership recorded separately. Ambiguous ranges, cross-part groups, and overlapping group/individual identities require review. Current modern 8-K membership includes Item 6.06; legacy integer-numbered 8-K forms remain outside this vocabulary.
+- **Traceable decisions.** Narrative CSVs add `ItemMembers`, `BlockSpans`, and `BoundaryEvidence`. A per-filing section-index JSON records selected spans, anchors, stopping points, and rejection reasons. Referenced annual MD&A retains its original pointer as a separate span without spilling that pointer into the preceding item.
+- **Trial verification.** All 50 offline tests passed, including 16 boundary/index checks. The 12 trial indexes have valid non-overlapping spans and unique item ownership. The independent source audit again passed all 24 target sections, retaining 7,914 eligible prose blocks and accounting for 6,142 numeric-row signatures with no detected leakage. The [trial report](docs/parser_2_trial_2026-11-11.md) records the sample, reproduction commands, and limits.
+
+### Next step
+
+Review the parser-2 trial and test on a manually annotated set of unseen issuers before treating this selection policy as general. Preserve all short narrative and review unknown/ambiguous boundaries. A lossless source-block ledger, additional form versions, independent validation of grouped disclosures, and the broader held-out benchmark remain future work; current success on the existing sample is not a universal accuracy guarantee.
 
 ## 2026-11-08 — Cross-issuer section comparison
 
-### Current work
+### Completed validation
 
 - **Compared 12 additional primary filings.** The sample contains three 10-Ks and three 10-Qs each from JPMorgan Chase and Walmart. The [comparison report](docs/sec_section_validation_2026-11-08.md) records all 24 Risk Factors/MD&A checks by accession and links to each local source. Original filing hashes match the acquisition manifests.
 - **Fixed confirmed JPMorgan extraction failures.** Repeated part page labels no longer truncate Risk Factors. Annual items get the correct part even with combined page labels. MD&A bodies presented outside a numbered item are recovered from their introductory paragraph up to the financial-report boundary; an annual Item 7 pointer is retained with the substantive body. An `ExtractionNote` records this recovery in narrative CSVs.
@@ -21,7 +26,7 @@ Switch to the desired parser branch before running its pipeline. The parser-1 da
 - **Independent source checks passed.** All 24 target sections have correct part/item metadata. All 7,914 eligible source prose blocks are retained, including 43 inside layout tables. All 6,142 checked numeric row signatures are accounted for in companion tables, with none found in the narrative. These criteria do not certify short bullets/footnotes, every table format, or sections outside Risk Factors and MD&A.
 - **Repeatable audit.** [validate_sections.py](scripts/validate_sections.py) reads source HTML independently of the parser and emits local JSON evidence and a Markdown report. Detailed evidence is under the ignored validation output directory. All 34 offline tests passed. Parser/audit regression tests cover truncation, descriptive MD&A, annual references, contents entries, missing prose, and table leakage.
 
-### Next step
+### Dataset assembly proposal (deferred for parser-2 evaluation)
 
 Assemble a traceable section-level dataset for Risk Factors and MD&A from the validated narrative CSVs and acquisition manifests. Retain CIK, accession, company, form, filing date, report date, part, item, extraction note, and validation status. Deduplicate repeated acquisition runs by filing identity and part/item. Keep quarterly references to annual risk disclosures distinguishable from substantive new risk text. Validate additional layouts before treating them as ready, and separately review other filing sections if they enter the NLP dataset.
 
