@@ -2,6 +2,12 @@
 
 Determining financial risk using NLP on EDGAR documents.
 
+The local branches separate the pipeline versions: `main` contains acquisition,
+`parser-1` contains the original improved section parser, and `parser-2` contains
+the boundary-selection experiment. Parser changes are saved as commits; use
+`git switch parser-1` or `git switch parser-2` to select the implementation.
+Downloaded and generated data stays local when switching branches.
+
 ## Step 1: Acquire SEC filings
 
 Requires Python 3.10 or newer. The acquisition command uses only Python's standard

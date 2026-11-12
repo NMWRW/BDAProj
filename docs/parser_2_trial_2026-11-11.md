@@ -2,8 +2,9 @@
 
 The `parser-2` branch implements the proposed rule: select acceptable section
 starts first, then extract to the next selected start in document order.
-Existing uncommitted work was retained when the branch was created. The trial
-changes remain uncommitted for review.
+Existing uncommitted work was retained when the branch was created. It has now
+been saved as independent commits: parser-1 holds the earlier implementation,
+parser-2 builds on it, and main contains the acquisition-only file tree.
 
 ## Implementation
 
