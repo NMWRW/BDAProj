@@ -44,6 +44,7 @@ def arguments(argv=None):
                         help="Also save XBRL companyfacts; not required for filing text")
     parser.add_argument("--min-interval", type=float, default=0.2,
                         help="Seconds between requests; default 0.2 (5/sec per process)")
+    parser.add_argument("--combined", type=bool, default=False, help="If True, filings are combined and ordered by filing date and accession number. Used when retrieving multiple form types")
     return parser.parse_args(argv)
 
 
@@ -74,7 +75,9 @@ def validate(args):
     for accession in args.accession:
         if not re.fullmatch(r"[0-9]{10}-[0-9]{2}-[0-9]{6}", accession):
             raise ValueError(f"Invalid accession: {accession}")
-
+    #raise error if combined is not a boolean
+    if not isinstance(args.combined, bool):
+        raise ValueError("combined must be a boolean value (True or False)")
 
 class SecClient:
     def __init__(self, user_agent, min_interval):
@@ -154,6 +157,25 @@ def select_filings(rows, forms, limit_per_form, accessions, as_of, from_date=Non
                             r["accessionNumber"]), reverse=True)[:limit_per_form])
     return selected
 
+def select_filingsOrdered(rows, forms, limit_per_form, accessions, as_of, from_date=None):
+    if accessions:
+        found = {row["accessionNumber"]: row for row in rows}
+        missing = set(accessions) - found.keys()
+        if missing:
+            raise ValueError(f"Accession(s) not found: {', '.join(sorted(missing))}; "
+                             "try --include-history for older filings")
+        selected = [found[a] for a in dict.fromkeys(accessions)]
+    else:
+        matches = [r for r in rows if r["form"] in forms and
+                   (as_of is None or r["filingDate"] <= as_of) and
+                   (from_date is None or r["filingDate"] >= from_date)]
+        matches = sorted(matches, key=lambda r: (r["filingDate"], r["accessionNumber"]), reverse=True)[:limit_per_form]
+        selected = matches[:limit_per_form]
+    selected.sort(
+        key=lambda r: (r["filingDate"], r["accessionNumber"])
+    )
+
+    return selected
 
 def archive_url(cik, row):
     accession = row["accessionNumber"]
@@ -245,8 +267,12 @@ def acquire(args, client=None):
                 history = save_api(f"https://data.sec.gov/submissions/{name}", name)
                 rows.extend(filing_rows(history))
         rows = list({row["accessionNumber"]: row for row in reversed(rows)}.values())
-        selected = select_filings(rows, args.forms, args.limit_per_form,
-                                  args.accession, args.as_of, args.from_date)
+        if(args.combined):
+            selected = select_filingsOrdered(rows, args.forms, args.limit_per_form,
+                                             args.accession, args.as_of, args.from_date)
+        else:
+            selected = select_filings(rows, args.forms, args.limit_per_form,
+                                      args.accession, args.as_of, args.from_date)
         if not selected:
             raise ValueError("No matching filings; check selection or try --include-history")
         manifest["selected_accessions"] = [r["accessionNumber"] for r in selected]
