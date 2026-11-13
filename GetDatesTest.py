@@ -1,9 +1,12 @@
 #tests that dates are extracted from manifest correctly
 #assumes manifest is combined 10-Q and 10-K in chronological order
+#use acquire_sec.py with limit x+1, first document will be skipped 
 import json
 import pandas as pd
+import argparse
+from pathlib import Path
 
-MANIFEST_PATH = "data\\sec\\CIK0000320193\\20261113T015022563029Z-1c14074d\\manifest.json"
+#Test manifest MANIFEST_PATH = "data\\sec\\CIK0000320193\\20261113T015022563029Z-1c14074d\\manifest.json"
 
 
 def get_dates(manifest_path):
@@ -37,6 +40,7 @@ def get_dates(manifest_path):
         print(f"\nForm: {form}")
         print(f"Accession Number: {accession_number}")
         print(f"Primary Document: {primary_document}")
+        filing["full"] = filing["accessionNumber"] + "_"+ filing["primaryDocument"] 
         
         if previous_report_date is not None:
 
@@ -45,17 +49,37 @@ def get_dates(manifest_path):
 
             days = (end_date - start_date).days + 1
 
-           
+            filing['start'] = start_date
+            filing['end'] = end_date
             print(f"Start: {start_date.date()}")
             print(f"End:   {end_date.date()}")
             print(f"Days:  {days}")
 
         else:
+            filing['start'] = 0
+            filing['end'] = 0
             print(f"Report date: {report_date.date()}")
             print("First report - no previous period available.")
 
         previous_report_date = report_date
+    
+    #creaste csv with info and save to same directory as manifest
+    pd.DataFrame([{
+        "Form": filing["form"],
+        "Accession Number": filing["accessionNumber"],
+        "Primary Document": filing["primaryDocument"],
+        "FullFileName": filing["full"],
+        "Report Date": filing["reportDate"],
+        "PeriodStart": filing["start"],
+        "PeriodEnd": filing["end"]
+    } for filing in filings[1:]]).to_csv(f"{manifest_path}_reporting_periods.csv", index=False)
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__) 
+    parser.add_argument("input", type=Path, help="Primary filing or acquisition manifest.json")
+    args = parser.parse_args(argv)
+    get_dates(args.input)
+    
 if __name__ == "__main__":
-    get_dates(MANIFEST_PATH)
+    raise SystemExit(main())
