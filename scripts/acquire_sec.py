@@ -208,7 +208,20 @@ def resolve_cik(args, client):
         raise ValueError(f"Ticker {args.ticker!r} not uniquely found; use --cik")
     return matches.pop()
 
+def resolve_ticker(args, client):
+    if args.ticker:
+        return args.ticker.upper()
 
+    companies = json.loads(client.get("https://www.sec.gov/files/company_tickers.json"))
+
+    matches = { c["ticker"] for c in companies.values()
+        if str(c["cik_str"]).zfill(10) == args.cik.zfill(10)}
+
+    if len(matches) != 1:
+        raise ValueError(
+            f"CIK {args.cik!r} does not have a unique ticker symbol")
+
+    return matches.pop()
 def write_file(path, body):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".part")
@@ -223,12 +236,13 @@ def acquire(args, client=None):
     validate(args)
     client = client or SecClient(args.user_agent, args.min_interval)
     cik = resolve_cik(args, client)
+    ticker = resolve_ticker(args, client)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
     output = args.output.expanduser().resolve() / f"CIK{cik}" / run_id
     output.mkdir(parents=True, exist_ok=False)
     manifest_path = output / "manifest.json"
     manifest = {
-        "schema_version": 1, "status": "in_progress", "cik": cik,
+        "schema_version": 1, "status": "in_progress", "cik": cik, "ticker": ticker,
         "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
         "selection": {"forms": args.forms, "limit_per_form": args.limit_per_form,
                       "accessions": args.accession, "from_date": args.from_date,
